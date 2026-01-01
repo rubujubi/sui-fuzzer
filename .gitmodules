@@ -4,6 +4,7 @@
 [submodule "aptos-core"]
 	path = aptos-core
 	url = https://github.com/movementlabsxyz/aptos-core.git
+	branch = l1-migration
 [submodule "examples/aptos-marketplace-contract"]
 	path = examples/aptos-marketplace-contract
 	url = https://github.com/0xCryptoAngel/aptos-marketplace-contract
