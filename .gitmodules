@@ -3,8 +3,8 @@
 	url = https://github.com/FuzzingLabs/sui.git
 [submodule "aptos-core"]
 	path = aptos-core
-	url = https://github.com/movementlabsxyz/aptos-core.git
-	branch = l1-migration
+	url = https://github.com/rubujubi/aptos-core.git
+	branch = l1-migration-with-fixes
 [submodule "examples/aptos-marketplace-contract"]
 	path = examples/aptos-marketplace-contract
 	url = https://github.com/0xCryptoAngel/aptos-marketplace-contract
