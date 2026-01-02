@@ -30,6 +30,8 @@ use crate::runner::stateful_runner::sui_runner::SuiRunner as StatefulSuiRunner;
 use crate::runner::stateless_runner::sui_runner::SuiRunner as StatelessSuiRunner;
 #[cfg(feature = "aptos")]
 use crate::runner::stateful_runner::aptos_runner::AptosRunner as StatefulAptosRunner;
+#[cfg(feature = "aptos")]
+use crate::runner::stateless_runner::aptos_runner::StatelessAptosRunner;
 use crate::runner::chain::Chain;
 use super::crash::Crash;
 use super::fuzzer_utils::load_corpus;
@@ -159,8 +161,16 @@ impl Fuzzer {
                     )),
                     #[cfg(feature = "aptos")]
                     Chain::Aptos => {
-                        // For now, Aptos only supports stateful mode
-                        panic!("Stateless mode not yet supported for Aptos. Please use stateful mode.");
+                        let modules = Self::build_test_modules(
+                            self.config.contract.as_ref().unwrap()
+                        );
+
+                        Box::new(StatelessAptosRunner::new(
+                            self.config.contract.as_ref().unwrap(),
+                            &self.target_module,
+                            &self.target_function.clone().unwrap(),
+                            modules,
+                        ))
                     },
                     #[cfg(not(feature = "sui"))]
                     Chain::Sui => unreachable!("Sui feature not enabled"),
@@ -178,18 +188,24 @@ impl Fuzzer {
                 let _ = std::thread::Builder::new()
                     .name(format!("Worker {}", i).to_string())
                     .spawn(move || {
-                        // Creates generic worker and starts it
-                        let mut w = Box::new(StatelessWorker::new(
-                                worker,
-                                stats,
-                                coverage_set,
-                                runner,
-                                mutator,
-                                seed,
-                                execs_before_cov_update,
-                                detectors,
-                            ));
-                        w.run();
+                        // Install panic hook for this thread
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            // Creates generic worker and starts it
+                            let mut w = Box::new(StatelessWorker::new(
+                                    worker,
+                                    stats,
+                                    coverage_set,
+                                    runner,
+                                    mutator,
+                                    seed,
+                                    execs_before_cov_update,
+                                    detectors,
+                                ));
+                            w.run();
+                        }));
+                        if let Err(e) = result {
+                            eprintln!("Worker thread panicked: {:?}", e);
+                        }
                     });
             }
         }
@@ -213,25 +229,62 @@ impl Fuzzer {
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.push(test_dir);
 
-        // Set up config tool
-        let config = BuildConfig {
-            test_mode: false,
+        println!("Attempting to compile package at: {:?}", path);
+
+        // Check if path exists
+        if !path.exists() {
+            eprintln!("ERROR: Contract path does not exist: {:?}", path);
+            eprintln!("Please check your config file's 'contract' field");
+            std::process::exit(1);
+        }
+
+        // Set up config for resolution graph (will be consumed)
+        // Use Move 2.1 to support l1-migration framework features like += and -=
+        let mut resolution_config = BuildConfig {
+            test_mode: true,
             install_dir: None,
             generate_docs: false,
             ..Default::default()
         };
+        resolution_config.compiler_config.compiler_version = Some(move_model::metadata::CompilerVersion::V2_1);
+        resolution_config.compiler_config.language_version = Some(move_model::metadata::LanguageVersion::V2_1);
+
+        // Set up config for compilation (will be consumed separately)
+        let mut compile_config = BuildConfig {
+            test_mode: true,
+            install_dir: None,
+            generate_docs: false,
+            ..Default::default()
+        };
+        compile_config.compiler_config.compiler_version = Some(move_model::metadata::CompilerVersion::V2_1);
+        compile_config.compiler_config.language_version = Some(move_model::metadata::LanguageVersion::V2_1);
 
         println!("Starting compilation...");
         let mut error_buffer = Vec::new();
-        let compilation_result = config.compile_package_no_exit(&path, &mut error_buffer);
+
+        // First create resolution graph (consumes resolution_config)
+        let resolution_graph = resolution_config
+            .resolution_graph_for_package(&path, &mut std::io::stderr())
+            .expect("Failed to create resolution graph");
+
+        // Then compile with resolution graph (consumes compile_config)
+        let compilation_result = compile_config.compile_package_no_exit(
+            resolution_graph,
+            vec![], // No external checks
+            &mut error_buffer
+        );
 
         match &compilation_result {
             Ok(_) => println!("Compilation successful!"),
             Err(e) => {
-                println!("Compilation failed with error: {:?}", e);
+                eprintln!("\n=== COMPILATION FAILED ===");
+                eprintln!("Error: {:?}", e);
                 if !error_buffer.is_empty() {
-                    println!("Error buffer contents: {}", String::from_utf8_lossy(&error_buffer));
+                    eprintln!("\nDetailed error output:");
+                    eprintln!("{}", String::from_utf8_lossy(&error_buffer));
                 }
+                eprintln!("\nPlease fix the compilation errors in your Move package before fuzzing.");
+                std::process::exit(1);
             }
         }
 
@@ -380,6 +433,8 @@ impl Fuzzer {
 
         // Utils for execs per sec
         let mut execs_per_sec_timer = Instant::now();
+        // Timer for status line printing (print every 2 seconds)
+        let mut status_print_timer = Instant::now();
 
         let mut events = VecDeque::new();
 
@@ -515,13 +570,15 @@ impl Fuzzer {
                         }
                     }
                 }
-                if self.global_stats.execs % 100000 == 0 {
-                    println!("{}s running time | {} execs/s | total execs: {} | crashes: {} | unique crashes: {} | coverage: {}", 
-                    self.global_stats.time_running, 
-                    self.global_stats.execs_per_sec, 
-                    self.global_stats.execs, 
-                    self.global_stats.crashes, 
-                    self.global_stats.unique_crashes, 
+                // Print status every 2 seconds
+                if status_print_timer.elapsed().as_secs() >= 2 {
+                    status_print_timer = Instant::now();
+                    println!("{}s running time | {} execs/s | total execs: {} | crashes: {} | unique crashes: {} | coverage: {}",
+                    self.global_stats.time_running,
+                    self.global_stats.execs_per_sec,
+                    self.global_stats.execs,
+                    self.global_stats.crashes,
+                    self.global_stats.unique_crashes,
                     self.coverage_set.len());
                 }
                 events.clear();
