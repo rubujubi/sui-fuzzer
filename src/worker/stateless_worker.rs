@@ -197,6 +197,8 @@ impl Worker for StatelessWorker {
             // Updates input
             if self.coverage_set.len() > 0 {
                 inputs = self.pick_and_mutate_inputs();
+            } else {
+                inputs = self.mutator.mutate(&inputs, 4);
             }
         }
     }
