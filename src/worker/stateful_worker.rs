@@ -38,6 +38,7 @@ fn convert_move_type_to_fuzzer_type(move_type: &move_model::ty::Type) -> crate::
             PrimitiveType::U128 => FuzzerType::U128(0),
             PrimitiveType::Bool => FuzzerType::Bool(false),
             PrimitiveType::Address => FuzzerType::Address([0; 32]),
+            PrimitiveType::Signer => FuzzerType::Address([0; 32]),
             _ => FuzzerType::U64(0), // Default fallback
         },
         MoveType::Vector(inner) => {
@@ -57,6 +58,16 @@ fn convert_move_type_to_fuzzer_type(move_type: &move_model::ty::Type) -> crate::
             // For any other types, default to U64
             FuzzerType::U64(0)
         }
+    }
+}
+
+#[cfg(feature = "aptos")]
+fn is_signer_param(move_type: &move_model::ty::Type) -> bool {
+    use move_model::ty::{PrimitiveType, Type as MoveType};
+    match move_type {
+        MoveType::Primitive(PrimitiveType::Signer) => true,
+        MoveType::Reference(_, inner) => is_signer_param(inner),
+        _ => false,
     }
 }
 
@@ -114,7 +125,12 @@ fn generate_abi_from_source(
         if let Some(f) = func {
 
             let max_coverage = f.get_bytecode().len();
-            let params = f.get_parameters().iter().map(|p| convert_move_type_to_fuzzer_type(&p.1)).collect();
+            let params = f
+                .get_parameters()
+                .iter()
+                .filter(|p| !is_signer_param(&p.1))
+                .map(|p| convert_move_type_to_fuzzer_type(&p.1))
+                .collect();
             (params, max_coverage)
         } else {
             panic!("Could not find target function !");
