@@ -1,6 +1,10 @@
 use bichannel::Channel;
 #[cfg(feature = "aptos")]
-use move_package::BuildConfig;
+use aptos_framework::BuiltPackage;
+#[cfg(feature = "aptos")]
+use aptos_framework::BuildOptions;
+#[cfg(feature = "aptos")]
+use bcs;
 #[cfg(feature = "sui")]
 use sui_move_build::BuildConfig;
 use std::collections::HashSet;
@@ -152,6 +156,7 @@ impl Fuzzer {
                 let chain = Chain::Sui;
                 #[cfg(feature = "aptos")]
                 let chain = Chain::Aptos;
+                let seed = self.config.seed.unwrap() + (i as u64);
                 let runner: Box<dyn Runner> = match chain {
                     #[cfg(feature = "sui")]
                     Chain::Sui => Box::new(StatelessSuiRunner::new(
@@ -161,7 +166,7 @@ impl Fuzzer {
                     )),
                     #[cfg(feature = "aptos")]
                     Chain::Aptos => {
-                        let modules = Self::build_test_modules(
+                        let (metadata, modules) = Self::build_test_modules(
                             self.config.contract.as_ref().unwrap()
                         );
 
@@ -169,7 +174,10 @@ impl Fuzzer {
                             self.config.contract.as_ref().unwrap(),
                             &self.target_module,
                             &self.target_function.clone().unwrap(),
+                            metadata,
                             modules,
+                            seed,
+                            self.config.aptos_helpers.clone(),
                         ))
                     },
                     #[cfg(not(feature = "sui"))]
@@ -179,8 +187,6 @@ impl Fuzzer {
                 };
                 self.target_parameters = runner.get_target_parameters();
                 self.max_coverage = runner.get_max_coverage();
-                // Increment seed so that each worker doesn't do the same thing
-                let seed = self.config.seed.unwrap() + (i as u64);
                 let execs_before_cov_update = self.config.execs_before_cov_update;
                 let mutator = Box::new(SuiMutator::new(seed, 12));
                 let detectors = self.detectors.clone();
@@ -224,7 +230,7 @@ impl Fuzzer {
         )
     }
     #[cfg(feature = "aptos")]
-    fn build_test_modules(test_dir: &str) -> Vec<Vec<u8>> {
+    fn build_test_modules(test_dir: &str) -> (Vec<u8>, Vec<Vec<u8>>) {
         // Locate to contract source files
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.push(test_dir);
@@ -238,69 +244,52 @@ impl Fuzzer {
             std::process::exit(1);
         }
 
-        // Set up config for resolution graph (will be consumed)
-        // Use Move 2.1 to support l1-migration framework features like += and -=
-        let mut resolution_config = BuildConfig {
-            test_mode: true,
+        println!("Starting compilation with BuiltPackage...");
+
+        // Use BuiltPackage to compile with proper runtime metadata injection
+        // This handles resource_group attributes and other Aptos-specific metadata
+        let build_options = BuildOptions {
+            dev: false,
+            with_srcs: false,
+            with_abis: false,
+            with_source_maps: false,
+            with_error_map: false,
+            with_docs: false,
             install_dir: None,
-            generate_docs: false,
-            ..Default::default()
+            named_addresses: std::collections::BTreeMap::new(),
+            override_std: None,
+            docgen_options: None,
+            skip_fetch_latest_git_deps: false,
+            bytecode_version: None,
+            compiler_version: Some(move_model::metadata::CompilerVersion::V2_1),
+            language_version: Some(move_model::metadata::LanguageVersion::V2_1),
+            skip_attribute_checks: false,
+            check_test_code: false,
+            known_attributes: aptos_framework::extended_checks::get_all_attribute_names().clone(),
+            experiments: vec![],
         };
-        resolution_config.compiler_config.compiler_version = Some(move_model::metadata::CompilerVersion::V2_1);
-        resolution_config.compiler_config.language_version = Some(move_model::metadata::LanguageVersion::V2_1);
 
-        // Set up config for compilation (will be consumed separately)
-        let mut compile_config = BuildConfig {
-            test_mode: true,
-            install_dir: None,
-            generate_docs: false,
-            ..Default::default()
-        };
-        compile_config.compiler_config.compiler_version = Some(move_model::metadata::CompilerVersion::V2_1);
-        compile_config.compiler_config.language_version = Some(move_model::metadata::LanguageVersion::V2_1);
-
-        println!("Starting compilation...");
-        let mut error_buffer = Vec::new();
-
-        // First create resolution graph (consumes resolution_config)
-        let resolution_graph = resolution_config
-            .resolution_graph_for_package(&path, &mut std::io::stderr())
-            .expect("Failed to create resolution graph");
-
-        // Then compile with resolution graph (consumes compile_config)
-        let compilation_result = compile_config.compile_package_no_exit(
-            resolution_graph,
-            vec![], // No external checks
-            &mut error_buffer
-        );
-
-        match &compilation_result {
-            Ok(_) => println!("Compilation successful!"),
+        let built_package = match BuiltPackage::build(path.clone(), build_options) {
+            Ok(pkg) => {
+                println!("Compilation successful!");
+                pkg
+            }
             Err(e) => {
                 eprintln!("\n=== COMPILATION FAILED ===");
                 eprintln!("Error: {:?}", e);
-                if !error_buffer.is_empty() {
-                    eprintln!("\nDetailed error output:");
-                    eprintln!("{}", String::from_utf8_lossy(&error_buffer));
-                }
                 eprintln!("\nPlease fix the compilation errors in your Move package before fuzzing.");
                 std::process::exit(1);
             }
-        }
+        };
 
-        #[cfg(feature= "sui")]
-        let compiled_pkg: CompiledPackage= compilation_result.unwrap();
+        let metadata = bcs::to_bytes(
+            &built_package.extract_metadata().expect("extract metadata"),
+        )
+        .expect("serialize metadata");
+        let modules = built_package.extract_code();
 
-        #[cfg(feature= "aptos")]
-        let (compiled_pkg, _global_env) = compilation_result.unwrap();
-        let modules: Vec<Vec<u8>> = compiled_pkg
-            .root_modules()
-            .map(|unit: &CompiledUnitWithSource| {
-                unit.unit.serialize(None)
-            })
-            .collect();
-
-        modules
+        println!("Extracted {} module(s) with runtime metadata", modules.len());
+        (metadata, modules)
     }
     fn start_stateful_threads(&mut self) {
 
@@ -310,7 +299,7 @@ impl Fuzzer {
           compiles Move contracts from source code and returns bytecode in modules
          */
         #[cfg(feature = "aptos")]
-        let modules = Self::build_test_modules(self.config.contract.as_ref().unwrap());
+        let (metadata, modules) = Self::build_test_modules(self.config.contract.as_ref().unwrap());
 
         for i in 0..self.config.nb_threads {
             // Creates the communication channel for the fuzzer and worker sides
@@ -324,6 +313,7 @@ impl Fuzzer {
             let chain = Chain::Sui;
             #[cfg(feature = "aptos")]
             let chain = Chain::Aptos;
+            let seed = self.config.seed.unwrap() + (i as u64);
             let runner: Box<dyn crate::runner::runner::StatefulRunner> = match chain {
                 #[cfg(feature = "sui")]
                 Chain::Sui => Box::new(StatefulSuiRunner::new(
@@ -334,7 +324,10 @@ impl Fuzzer {
                 Chain::Aptos => {
                     Box::new(StatefulAptosRunner::new(
                         &self.target_module,
+                        metadata.clone(),
                         modules.clone(),
+                        seed,
+                        self.config.aptos_helpers.clone(),
                     ))
                 },
                 #[cfg(not(feature = "sui"))]
@@ -343,8 +336,6 @@ impl Fuzzer {
                 Chain::Aptos => unreachable!("Aptos feature not enabled"),
             };
             self.max_coverage = runner.get_max_coverage();
-            // Increment seed so that each worker doesn't do the same thing
-            let seed = self.config.seed.unwrap() + (i as u64);
             let execs_before_cov_update = self.config.execs_before_cov_update;
             /* TODO:
             Currently addded gas based logic inside SuiMutator. In the future it should be separated into AptosMutator instead of reusing SuiMutator
