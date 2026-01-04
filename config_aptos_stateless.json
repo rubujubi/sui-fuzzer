@@ -1,11 +1,14 @@
 {
-  "use_ui": true,
+  "use_ui": false,
   "nb_threads": 1, 
   "seed": 4242,
-  "contract": "./examples/aptos-marketplace-contract",
+  "contract": "../../moveindustries/usdc-bridge/module",
   "execs_before_cov_update": 10000,
   "corpus_dir": "./corpus",
   "crashes_dir": "./crashes",
-  "fuzz_functions_prefix": "fuzz_",
-  "max_call_sequence_size": 5
+  "fuzz_functions_prefix": "",
+  "max_call_sequence_size": 5,
+  "aptos_helpers": {
+  "usdcx::mint": "usdcx_mint_v1"
+}
 }
