@@ -1,33 +1,36 @@
-use bcs;
-use std::hash::{Hash, Hasher};
-
 #[cfg(feature = "aptos")]
-use aptos_language_e2e_tests::executor::FakeExecutor;
 use aptos_language_e2e_tests::{
-    account_universe::AccountCurrent,
-    account::{AccountData,Account}};
+    account::Account,
+    executor::FakeExecutor,
+};
 #[cfg(feature = "aptos")]
-use aptos_types::{
-    transaction::{
-        EntryFunction,
-        TransactionPayload,
-        TransactionArgument,
-        TransactionStatus,
-        RawTransaction,
-        SignedTransaction,
-        TransactionOutput,
-        Transaction,
-        signature_verified_transaction::SignatureVerifiedTransaction,
-    },
-    chain_id::ChainId,
+use aptos_types::transaction::{
+    EntryFunction,
+    TransactionPayload,
+    TransactionArgument,
+    TransactionStatus,
+    TransactionOutput,
+    ExecutionStatus,
 };
 #[cfg(feature = "aptos")]
 use move_core_types::{
     account_address::AccountAddress,
     value::{MoveValue, MoveStruct},
-    ident_str, identifier::Identifier, language_storage::ModuleId,
-    transaction_argument
+    identifier::Identifier,
+    language_storage::ModuleId,
 };
+#[cfg(feature = "aptos")]
+use move_binary_format::{CompiledModule, access::ModuleAccess};
+#[cfg(feature = "aptos")]
+use std::collections::HashMap;
+#[cfg(feature = "aptos")]
+use crate::runner::aptos_helpers::registry::build_helpers;
+#[cfg(feature = "aptos")]
+use crate::runner::aptos_helpers::AptosHelper;
+#[cfg(feature = "aptos")]
+use aptos_cached_packages::aptos_stdlib::code_publish_package_txn;
+#[cfg(feature = "aptos")]
+use bcs;
 
 use crate::runner::runner::{Runner, StatefulRunner};
 use crate::{
@@ -35,22 +38,6 @@ use crate::{
     mutator::types::Type as FuzzerType,
 };
 
-use tokio::runtime::Runtime;
-use rand::rngs::OsRng;
-use aptos_crypto::{HashValue,ed25519::{Ed25519PrivateKey, Ed25519PublicKey}};
-use aptos_sdk::transaction_builder::TransactionBuilder;
-
-use aptos_vm::AptosVM;
-
-use std::sync::Arc;
-use aptos_secure_storage::InMemoryStorage;
-use aptos_executor::block_executor::{BlockExecutor, TransactionBlockExecutor};
-use aptos_types::block_executor::partitioner::{ExecutableTransactions};
-use aptos_types::block_executor::config::BlockExecutorConfigFromOnchain;
-use aptos_storage_interface::{DbReaderWriter, cached_state_view::CachedStateView};
-use aptos_crypto::hash::DefaultHasher;
-use aptos_storage_interface::state_view::LatestDbStateCheckpointView;
-use aptos_storage_interface::mock::MockDbReaderWriter;
 #[cfg(feature = "aptos")]
 pub fn generate_inputs(inputs: Vec<FuzzerType>) -> Vec<MoveValue> {
     let mut res = vec![];
@@ -66,7 +53,7 @@ pub fn generate_inputs(inputs: Vec<FuzzerType>) -> Vec<MoveValue> {
                 res.push(MoveValue::Vector(generate_inputs(vec)))
             }
             FuzzerType::Struct(values) => res.push(MoveValue::Struct(
-                MoveStruct::Runtime(generate_inputs(values)), 
+                MoveStruct::Runtime(generate_inputs(values)),
             )),
             FuzzerType::Reference(_, _) => {
                 res.push(MoveValue::Address(AccountAddress::random()))
@@ -76,40 +63,88 @@ pub fn generate_inputs(inputs: Vec<FuzzerType>) -> Vec<MoveValue> {
     }
     res
 }
+
 #[cfg(feature = "aptos")]
 pub struct AptosRunner {
-    executor: Option<BlockExecutor<AptosVM>>,
+    executor: FakeExecutor,
+    account: Account,
     target_module: String,
     target_function: Option<FuzzerType>,
     modules: Vec<Vec<u8>>,
+    package_metadata: Vec<u8>,
     package_address: AccountAddress,
-    account_current: AccountCurrent,
+    sequence_number: u64,
+    aptos_helpers: HashMap<String, String>,
+    helper_instances: HashMap<String, Box<dyn AptosHelper>>,
+}
+
+// Mark as Send - FakeExecutor is created and used within the same worker thread
+#[cfg(feature = "aptos")]
+unsafe impl Send for AptosRunner {}
+
+#[cfg(feature = "aptos")]
+fn resolve_package_address(
+    modules: &[Vec<u8>],
+    target_module: &str,
+) -> Option<AccountAddress> {
+    let mut first_address = None;
+    for bytes in modules {
+        if let Ok(module) = CompiledModule::deserialize(bytes) {
+            let addr: AccountAddress = *module.address();
+            if first_address.is_none() {
+                first_address = Some(addr);
+            }
+            if module.name().as_str() == target_module {
+                return Some(addr);
+            }
+        }
+    }
+    first_address
 }
 
 #[cfg(feature = "aptos")]
 impl AptosRunner {
-    pub fn new(target_module: &str, modules: Vec<Vec<u8>>) -> Self {
-        let account = Account::new();
+    fn helper_for_function(&self, function_name: &str) -> Option<&dyn AptosHelper> {
+        let key = format!("{}::{}", self.target_module, function_name);
+        let helper_name = self.aptos_helpers.get(&key)?;
+        self.helper_instances.get(helper_name).map(|h| h.as_ref())
+    }
+
+    pub fn new(
+        target_module: &str,
+        package_metadata: Vec<u8>,
+        modules: Vec<Vec<u8>>,
+        seed: u64,
+        aptos_helpers: HashMap<String, String>,
+    ) -> Self {
+        // Create executor with genesis state (includes framework modules, chain config, etc.)
+        let executor = FakeExecutor::from_head_genesis();
+
+        let helper_instances = build_helpers(&aptos_helpers, seed);
+
         let mut runner = Self {
-            executor: None,
+            executor,
+            account: Account::new(), // placeholder, will be set in setup
             target_module: target_module.to_string(),
             target_function: None,
             modules,
+            package_metadata,
             package_address: AccountAddress::from_hex_literal("0x1").unwrap(),
-            account_current: AccountCurrent::new(AccountData::with_account(account, 1_000_000, 0)),
+            sequence_number: 0,
+            aptos_helpers,
+            helper_instances,
         };
-        
+
         runner.setup();
         runner
     }
 
-    fn convert_move_value_to_aptos_arg(&self, value: &move_core_types::value::MoveValue) -> Option<TransactionArgument> {
-        #[cfg(feature = "aptos")]
-        use move_core_types::value::MoveValue;
-        
+    fn convert_move_value_to_aptos_arg(&self, value: &MoveValue) -> Option<TransactionArgument> {
         match value {
             MoveValue::Bool(v) => Some(TransactionArgument::Bool(*v)),
             MoveValue::U8(v) => Some(TransactionArgument::U8(*v)),
+            MoveValue::U16(v) => Some(TransactionArgument::U16(*v)),
+            MoveValue::U32(v) => Some(TransactionArgument::U32(*v)),
             MoveValue::U64(v) => Some(TransactionArgument::U64(*v)),
             MoveValue::U128(v) => Some(TransactionArgument::U128(*v)),
             MoveValue::Address(addr) => Some(TransactionArgument::Address(*addr)),
@@ -132,148 +167,99 @@ impl AptosRunner {
         target_function: &str,
         args: Vec<TransactionArgument>,
     ) -> Result<(TransactionStatus, u64), Error> {
-
-        let account = self.account_current.account();
         let module_id = ModuleId::new(
             self.package_address,
             Identifier::new(self.target_module.as_str()).map_err(|e| Error::Unknown {
                 message: format!("Invalid module name: {}", e),
             })?,
         );
-        
+
         let function_id = Identifier::new(target_function).map_err(|e| Error::Unknown {
             message: format!("Invalid function name: {}", e),
         })?;
 
-        let entry_function = EntryFunction::new(module_id, function_id, vec![], transaction_argument::convert_txn_args(&args));
+        // Convert TransactionArguments to bytes for EntryFunction
+        let args_bytes: Vec<Vec<u8>> = args.into_iter().map(|arg| {
+            match arg {
+                TransactionArgument::U8(v) => bcs::to_bytes(&v).unwrap(),
+                TransactionArgument::U16(v) => bcs::to_bytes(&v).unwrap(),
+                TransactionArgument::U32(v) => bcs::to_bytes(&v).unwrap(),
+                TransactionArgument::U64(v) => bcs::to_bytes(&v).unwrap(),
+                TransactionArgument::U128(v) => bcs::to_bytes(&v).unwrap(),
+                TransactionArgument::U256(v) => bcs::to_bytes(&v).unwrap(),
+                TransactionArgument::Bool(v) => bcs::to_bytes(&v).unwrap(),
+                TransactionArgument::Address(v) => bcs::to_bytes(&v).unwrap(),
+                TransactionArgument::U8Vector(v) => bcs::to_bytes(&v).unwrap(),
+                TransactionArgument::Serialized(v) => v,
+            }
+        }).collect();
+
+        let entry_function = EntryFunction::new(module_id, function_id, vec![], args_bytes);
         let payload = TransactionPayload::EntryFunction(entry_function);
 
-        // Create raw transaction
-        let raw_txn = RawTransaction::new(
-            *account.address(),
-            0, // sequence number
-            payload,
-            1_000_000, // max gas
-            1, // gas price
-            10, // expiration
-            ChainId::test(),
-        );
+        // Create and sign transaction using FakeExecutor's account helper
+        let txn = self.account
+            .transaction()
+            .payload(payload)
+            .sequence_number(self.sequence_number)
+            .sign();
 
-        // Sign the transaction
-        let signed_txn: SignedTransaction = raw_txn
-            .sign(&account.privkey, account.pubkey.as_ed25519().expect("pubkey error").clone())
-            .map_err(|e| Error::Unknown {
-                message: format!("Failed to sign transaction: {}", e),
-            })?
-            .into_inner();
-        let transaction: Transaction = Transaction::UserTransaction(signed_txn);
-        let sv_txn: SignatureVerifiedTransaction = transaction.into();
+        // Execute transaction
+        let output = self.executor.execute_transaction(txn);
 
-        // Create executable transactions
-        let transactions = ExecutableTransactions::Unsharded(vec![sv_txn]);
-        
-        // Get executor and create state view
-        let executor = self.executor.as_ref().ok_or_else(|| Error::Unknown {
-            message: "Executor not initialized".to_string(),
-        })?;
+        // Apply write set to maintain state
+        self.executor.apply_write_set(output.write_set());
 
-        let version = executor.db.reader.get_latest_state_checkpoint_version()
-            .map_err(|e| Error::Unknown {
-                message: format!("Failed to get version: {}", e),
-            })?
-            .unwrap_or(0);
-        let state_view = CachedStateView::new(
-            aptos_types::state_store::StateViewId::Miscellaneous,
-            executor.db.reader.clone(),
-            version,
-            aptos_scratchpad::SparseMerkleTree::new_empty(),
-            std::sync::Arc::new(aptos_storage_interface::async_proof_fetcher::AsyncProofFetcher::new(executor.db.reader.clone())),
-        ).map_err(|e| Error::Unknown {
-            message: format!("Failed to create state view: {}", e),
-        })?;
-        let config = BlockExecutorConfigFromOnchain::new_no_block_limit();
+        // Increment sequence number for next transaction
+        self.sequence_number += 1;
 
-        // Execute using AptosVM
-        let chunk_output = AptosVM::execute_transaction_block(transactions, state_view, config)
-            .map_err(|e| Error::Unknown {
-                message: format!("Transaction execution failed: {}", e),
-            })?;
-  
-        // Extract result
-        if let Some(output) = chunk_output.transaction_outputs.first() {
-            let gas_used = output.gas_used();
-            Ok((output.status().clone(), gas_used))
-        } else {
-            Err(Error::Unknown {
-                message: "No transaction output".to_string(),
-            })
-        }
+        let gas_used = output.gas_used();
+        Ok((output.status().clone(), gas_used))
     }
 
-    pub fn publish(
-        account: &mut AccountCurrent,
-        modules: Vec<Vec<u8>>,   // compiled bytecode
-        executor: &BlockExecutor<AptosVM>,
-    ) -> anyhow::Result<TransactionOutput> {
+    fn initialize_helper(&mut self, args: Vec<Vec<u8>>) -> Result<(TransactionStatus, u64), Error> {
+        let args = args.into_iter().map(TransactionArgument::Serialized).collect();
+        self.send_transaction("initialize", args)
+    }
 
-        let empty_metadata:Vec<u8> = vec![];
-        // Create a transaction payload
-        let payload = TransactionPayload::EntryFunction(EntryFunction::new(
-            ModuleId::new(
-                AccountAddress::from_hex_literal("0x1").unwrap(),
-                ident_str!("code").to_owned(),
-            ),
-            ident_str!("publish_package_txn").to_owned(),
-            vec![],
-            vec![
-                bcs::to_bytes(&empty_metadata).unwrap(),
-                bcs::to_bytes(&modules).unwrap(),
-            ],
-        ));
-        // Sequence number for sender
-        let seq_num = 0;
+    fn publish_modules(&mut self) -> Result<TransactionOutput, Error> {
+        let payload = code_publish_package_txn(self.package_metadata.clone(), self.modules.clone());
 
-        // Create raw transaction
-        let raw_txn = RawTransaction::new(
-            *account.account().address(),
-            seq_num,
-            payload,
-            1_000_000,
-            1,
-            10,
-            ChainId::test(),
-        );
+        // Create and sign publish transaction
+        let txn = self.account
+            .transaction()
+            .payload(payload)
+            .sequence_number(self.sequence_number)
+            .sign();
 
-        // Sign the txn
-        let signed_txn: SignedTransaction = raw_txn
-            .sign(&account.account().privkey, account.account().pubkey.as_ed25519().expect("pubkey error").clone())?
-            .into_inner();
-        let transaction: Transaction = Transaction::UserTransaction(signed_txn);
-        let sv_txn: SignatureVerifiedTransaction = transaction.into();
-        let transactions = ExecutableTransactions::Unsharded(vec![sv_txn]);
-        let config = BlockExecutorConfigFromOnchain::new_no_block_limit();
+        // Execute publish transaction
+        let output = self.executor.execute_transaction(txn);
 
-        // Create state view using the executor's database
-        let version = executor.db.reader.get_latest_state_checkpoint_version()?.unwrap_or(0);
-        let state_view = CachedStateView::new(
-            aptos_types::state_store::StateViewId::Miscellaneous,
-            executor.db.reader.clone(),
-            version,
-            aptos_scratchpad::SparseMerkleTree::new_empty(),
-            std::sync::Arc::new(aptos_storage_interface::async_proof_fetcher::AsyncProofFetcher::new(executor.db.reader.clone())),
-        )?;
-
-        // Execute using AptosVM
-        let chunk_output = AptosVM::execute_transaction_block(transactions, state_view, config)?;
-
-        // Extract result
-        if let Some(output) = chunk_output.transaction_outputs.first() {
-            Ok(output.clone())
-        } else {
-            Err(anyhow::anyhow!("No transaction output"))
+        // Check if publish succeeded
+        match output.status() {
+            TransactionStatus::Keep(ExecutionStatus::Success) => {
+                // Apply write set to commit the published modules
+                self.executor.apply_write_set(output.write_set());
+                self.sequence_number += 1;
+                Ok(output)
+            },
+            TransactionStatus::Keep(status) => {
+                Err(Error::Unknown {
+                    message: format!("Publish failed with status: {:?}", status),
+                })
+            },
+            TransactionStatus::Discard(status) => {
+                Err(Error::Unknown {
+                    message: format!("Publish discarded: {:?}", status),
+                })
+            },
+            TransactionStatus::Retry => {
+                Err(Error::Unknown {
+                    message: "Publish needs retry".to_string(),
+                })
+            },
         }
-}
-
+    }
 }
 
 #[cfg(feature = "aptos")]
@@ -283,25 +269,32 @@ impl Runner for AptosRunner {
         inputs: Vec<FuzzerType>,
     ) -> Result<(Option<Coverage>, u64), (Option<Coverage>, Error)> {
         let mut args = vec![];
-        let inputs_clone = inputs.clone();
+        let function_name = match &self.target_function {
+            Some(FuzzerType::Function(name, _, _)) => name.clone(),
+            _ => {
+                return Err((
+                    None,
+                    Error::Unknown {
+                        message: "Invalid target function".to_string(),
+                    },
+                ))
+            }
+        };
+
+        let adjusted_inputs = if let Some(helper) = self.helper_for_function(&function_name) {
+            helper.transform_inputs(&inputs).unwrap_or_else(|| inputs.clone())
+        } else {
+            inputs.clone()
+        };
 
         // Convert fuzzer inputs to transaction arguments
-        for input in &generate_inputs(inputs_clone) {
+        for input in &generate_inputs(adjusted_inputs) {
             if let Some(arg) = self.convert_move_value_to_aptos_arg(input) {
                 args.push(arg);
             }
         }
 
-        let response = self.send_transaction(
-            &self
-                .target_function
-                .clone()
-                .unwrap()
-                .as_function()
-                .unwrap()
-                .0,
-            args,
-        );
+        let response = self.send_transaction(&function_name, args);
 
         match response {
             Ok((status, gas_used)) => {
@@ -347,7 +340,7 @@ impl Runner for AptosRunner {
     }
 
     fn get_max_coverage(&self) -> usize {
-        100 // Place holder, gas meter is used instead
+        100 // Placeholder, gas meter is used instead
     }
 
     fn set_target_function(&mut self, function: &FuzzerType) {
@@ -358,21 +351,35 @@ impl Runner for AptosRunner {
 #[cfg(feature = "aptos")]
 impl StatefulRunner for AptosRunner {
     fn setup(&mut self) {
-        // Create mock database for testing
-        let db = DbReaderWriter::new(MockDbReaderWriter);
-        let executor = BlockExecutor::<AptosVM>::new(db);
-        self.executor = Some(executor);
+        let package_address = resolve_package_address(&self.modules, &self.target_module);
+        self.account = if let Some(addr) = package_address {
+            self.executor.new_account_at(addr)
+        } else {
+            self.executor
+                .create_accounts(1, 1_000_000_000_000_000, 0)
+                .remove(0)
+        };
 
-        // 3. Publish fuzzing Move package
-        let output = Self::publish(
-            &mut self.account_current,
-            self.modules.clone(),
-            self.executor.as_ref().unwrap(),
-        ).expect("publish failed");
+        // Update package_address to the account's address (modules will be published here)
+        self.package_address = *self.account.address();
 
-        // 5. Run fuzz_init entry function (if present in the module)
-        let _ = self.send_transaction("fuzz_init", vec![])
-            .expect("Could not init fuzzing!");
+        // Publish the fuzzing Move package
+        if !self.modules.is_empty() {
+            self.publish_modules().expect("Failed to publish modules");
+        }
+
+        let admin_addr = *self.account.address();
+        let init_args: Vec<Vec<Vec<u8>>> = self
+            .helper_instances
+            .values()
+            .filter_map(|helper| helper.initialize_args(admin_addr))
+            .collect();
+        for args in init_args {
+            let _ = self.initialize_helper(args);
+        }
+
+        // Run fuzz_init entry function if present in the module
+        let _ = self.send_transaction("fuzz_init", vec![]);
     }
 }
 
@@ -382,4 +389,48 @@ pub struct AptosRunner {
     target_module: String,
     target_function: Option<FuzzerType>,
     modules: Vec<Vec<u8>>,
+}
+
+#[cfg(not(feature = "aptos"))]
+impl AptosRunner {
+    pub fn new(_target_module: &str, _modules: Vec<Vec<u8>>) -> Self {
+        panic!("Aptos support not compiled. Please enable the 'aptos' feature.");
+    }
+}
+
+#[cfg(not(feature = "aptos"))]
+impl Runner for AptosRunner {
+    fn execute(
+        &mut self,
+        _inputs: Vec<FuzzerType>,
+    ) -> Result<(Option<Coverage>, u64), (Option<Coverage>, Error)> {
+        unreachable!("Aptos support not compiled");
+    }
+
+    fn get_target_parameters(&self) -> Vec<FuzzerType> {
+        unreachable!("Aptos support not compiled");
+    }
+
+    fn get_target_module(&self) -> String {
+        unreachable!("Aptos support not compiled");
+    }
+
+    fn get_target_function(&self) -> FuzzerType {
+        unreachable!("Aptos support not compiled");
+    }
+
+    fn get_max_coverage(&self) -> usize {
+        unreachable!("Aptos support not compiled");
+    }
+
+    fn set_target_function(&mut self, _function: &FuzzerType) {
+        unreachable!("Aptos support not compiled");
+    }
+}
+
+#[cfg(not(feature = "aptos"))]
+impl StatefulRunner for AptosRunner {
+    fn setup(&mut self) {
+        unreachable!("Aptos support not compiled");
+    }
 }
