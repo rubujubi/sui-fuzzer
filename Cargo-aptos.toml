@@ -26,6 +26,9 @@ rand = "0.8.5"
 url = "2.0"
 ark-std = "0.5.0"
 move-package = { path = "./aptos-core/third_party/move/tools/move-package" }
+move-binary-format = { path = "./aptos-core/third_party/move/move-binary-format" }
+libsecp256k1 = "0.7.0"
+tiny-keccak = { version = "2.0.2", features = ["keccak"] }
 anyhow = "1.0"
 
 # Aptos dependencies
@@ -43,7 +46,9 @@ aptos-executor-types = {path = "./aptos-core/execution/executor-types"}
 aptos-block-executor = {path = "./aptos-core/aptos-move/block-executor"}
 aptos-storage-interface = {path = "./aptos-core/storage/storage-interface", features = ["fuzzing"]}
 aptos-scratchpad = {path = "./aptos-core/storage/scratchpad"}
+aptos-framework = {path = "./aptos-core/aptos-move/framework"}
+aptos-cached-packages = {path = "./aptos-core/aptos-move/framework/cached-packages"}
+
 [features]
 default = ["aptos"]
 aptos = []
-
