@@ -1,15 +1,17 @@
 use aptos_language_e2e_tests::executor::FakeExecutor;
 use aptos_language_e2e_tests::account::Account;
 use aptos_types::transaction::{
-    EntryFunction, RawTransaction, SignedTransaction, TransactionPayload,
-    TransactionArgument, TransactionStatus, TransactionOutput,
+    EntryFunction, TransactionPayload,
+    TransactionArgument, TransactionStatus, TransactionOutput, ExecutionStatus,
 };
-use aptos_types::chain_id::ChainId;
 use move_core_types::transaction_argument;
 use move_core_types::account_address::AccountAddress;
 use move_core_types::identifier::Identifier;
-use move_core_types::ident_str;
 use move_core_types::language_storage::ModuleId;
+use move_binary_format::{CompiledModule, access::ModuleAccess};
+use std::collections::HashMap;
+use crate::runner::aptos_helpers::registry::build_helpers;
+use crate::runner::aptos_helpers::AptosHelper;
 use crate::runner::runner::Runner;
 use crate::fuzzer::coverage::Coverage;
 use crate::fuzzer::error::Error;
@@ -17,12 +19,33 @@ use crate::mutator::types::Type as FuzzerType;
 use super::aptos_runner_utils::{
     generate_abi_from_source, generate_inputs, convert_move_value_to_aptos_arg,
 };
-use std::sync::{Arc, Mutex};
+use aptos_cached_packages::aptos_stdlib::code_publish_package_txn;
 
 /// Helper to check if transaction status is Keep
 fn is_kept(status: &TransactionStatus) -> bool {
     matches!(status, TransactionStatus::Keep(_))
 }
+
+// Publish must be signed by the module's declared address; derive it from bytecode.
+fn resolve_package_address(
+    modules: &[Vec<u8>],
+    target_module: &str,
+) -> Option<AccountAddress> {
+    let mut first_address = None;
+    for bytes in modules {
+        if let Ok(module) = CompiledModule::deserialize(bytes) {
+            let addr: AccountAddress = *module.address();
+            if first_address.is_none() {
+                first_address = Some(addr);
+            }
+            if module.name().as_str() == target_module {
+                return Some(addr);
+            }
+        }
+    }
+    first_address
+}
+
 
 pub struct StatelessAptosRunner {
     // We use a lazy initialization pattern - executor is created on first use
@@ -31,6 +54,7 @@ pub struct StatelessAptosRunner {
     target_module: String,
     target_function: FuzzerType,
     modules: Vec<Vec<u8>>,
+    package_metadata: Vec<u8>,
     package_address: Option<AccountAddress>,
     account: Option<Account>,
     max_coverage: usize,
@@ -39,17 +63,28 @@ pub struct StatelessAptosRunner {
     // Sequence number for transactions - starts at 2 after publish (0) and fuzz_init (1)
     // For stateless fuzzing, we use the same sequence number since we don't apply write sets
     next_sequence_number: u64,
+    aptos_helpers: HashMap<String, String>,
+    helper_instances: HashMap<String, Box<dyn AptosHelper>>,
 }
 
 // Mark as Send - we'll initialize the FakeExecutor in the worker thread
 unsafe impl Send for StatelessAptosRunner {}
 
 impl StatelessAptosRunner {
+    fn helper_for_function(&self, function_name: &str) -> Option<&dyn AptosHelper> {
+        let key = format!("{}::{}", self.target_module, function_name);
+        let helper_name = self.aptos_helpers.get(&key)?;
+        self.helper_instances.get(helper_name).map(|h| h.as_ref())
+    }
+
     pub fn new(
         contract_path: &str,
         target_module: &str,
         target_function: &str,
+        package_metadata: Vec<u8>,
         modules: Vec<Vec<u8>>,
+        seed: u64,
+        aptos_helpers: HashMap<String, String>,
     ) -> Self {
         // Extract ABI from source (this part is thread-safe)
         let (params, max_coverage) = generate_abi_from_source(
@@ -70,17 +105,22 @@ impl StatelessAptosRunner {
             None,
         );
 
+        let helper_instances = build_helpers(&aptos_helpers, seed);
+
         Self {
             executor: None,  // Will be initialized lazily in worker thread
             target_module: target_module.to_string(),
             target_function: target_function_type,
             modules,
+            package_metadata,
             package_address: None,
             account: None,
             max_coverage,
             contract_path: contract_path.to_string(),
             initialized: false,
             next_sequence_number: 0,  // Will be set during initialization
+            aptos_helpers,
+            helper_instances,
         }
     }
 
@@ -95,8 +135,12 @@ impl StatelessAptosRunner {
         // Create FakeExecutor with genesis state (includes Aptos framework)
         let mut executor = FakeExecutor::from_head_genesis();
 
-        // Create and fund an account
-        let account = executor.create_accounts(1, 10_000_000_000, 0).pop().unwrap();
+        let package_address = resolve_package_address(&self.modules, &self.target_module);
+        let account = if let Some(addr) = package_address {
+            executor.new_account_at(addr)
+        } else {
+            executor.create_accounts(1, 10_000_000_000, 0).pop().unwrap()
+        };
         let package_address = *account.address();
 
         println!("Created account at address: {:?}", package_address);
@@ -105,13 +149,32 @@ impl StatelessAptosRunner {
         let mut current_seq = 0u64;
 
         // Publish modules
-        match Self::publish_modules(&mut executor, &account, &self.modules, package_address) {
+        match Self::publish_modules(
+            &mut executor,
+            &account,
+            &self.modules,
+            package_address,
+            &self.package_metadata,
+        ) {
             Ok(output) => {
                 println!("Module publishing result status: {:?}", output.status());
-                if is_kept(output.status()) {
-                    current_seq = 1;  // Next sequence number after successful publish
-                } else {
-                    eprintln!("Warning: Module publishing was not kept!");
+                match output.status() {
+                    TransactionStatus::Keep(exec_status) => match exec_status {
+                        ExecutionStatus::Success => {
+                            println!("Module publishing succeeded!");
+                            current_seq = 1;
+                        }
+                        _ => {
+                            eprintln!("Module publishing failed with execution status: {:?}", exec_status);
+                            eprintln!("Events: {:?}", output.events());
+                        }
+                    },
+                    TransactionStatus::Discard(status) => {
+                        eprintln!("Module publishing discarded: {:?}", status);
+                    }
+                    TransactionStatus::Retry => {
+                        eprintln!("Module publishing needs retry");
+                    }
                 }
             }
             Err(e) => {
@@ -119,12 +182,41 @@ impl StatelessAptosRunner {
             }
         }
 
-        // Initialize with fuzz_init if it exists (optional) - uses sequence 1
-        match Self::call_fuzz_init(&mut executor, &account, &self.target_module, package_address) {
+        if current_seq > 0 {
+            for helper in self.helper_instances.values() {
+                if let Some(args) = helper.initialize_args(*account.address()) {
+                    match self.call_initialize_helper(
+                        &mut executor,
+                        &account,
+                        package_address,
+                        current_seq,
+                        args,
+                    ) {
+                        Ok(output) => match output.status() {
+                            TransactionStatus::Keep(ExecutionStatus::Success) => {
+                                executor.apply_write_set(output.write_set());
+                                current_seq += 1;
+                            }
+                            _ => eprintln!("initialize failed with status: {:?}", output.status()),
+                        },
+                        Err(e) => eprintln!("initialize failed: {:?}", e),
+                    }
+                }
+            }
+        }
+
+        // Initialize with fuzz_init if it exists (optional)
+        match Self::call_fuzz_init(
+            &mut executor,
+            &account,
+            &self.target_module,
+            package_address,
+            current_seq,
+        ) {
             Ok(output) => {
                 println!("fuzz_init called successfully");
                 if is_kept(output.status()) {
-                    current_seq = 2;  // Next sequence number after successful fuzz_init
+                    current_seq += 1;
                 }
             }
             Err(e) => eprintln!("Note: fuzz_init not found or failed (this is OK): {:?}", e),
@@ -146,51 +238,27 @@ impl StatelessAptosRunner {
         account: &Account,
         modules: &[Vec<u8>],
         _package_address: AccountAddress,
+        package_metadata: &[u8],
     ) -> anyhow::Result<TransactionOutput> {
-        let empty_metadata: Vec<u8> = vec![];
+        // Build proper package metadata
+        let payload = code_publish_package_txn(package_metadata.to_vec(), modules.to_vec());
 
-        // Create publish transaction payload using the code::publish_package_txn function
-        let payload = TransactionPayload::EntryFunction(EntryFunction::new(
-            ModuleId::new(
-                AccountAddress::from_hex_literal("0x1").unwrap(),
-                ident_str!("code").to_owned(),
-            ),
-            ident_str!("publish_package_txn").to_owned(),
-            vec![],
-            vec![
-                bcs::to_bytes(&empty_metadata).unwrap(),
-                bcs::to_bytes(&modules.to_vec()).unwrap(),
-            ],
-        ));
-
-        // Create and sign transaction
-        let raw_txn = RawTransaction::new(
-            *account.address(),
-            0, // sequence number
-            payload,
-            1_000_000, // max gas
-            100, // gas unit price
-            u64::MAX, // expiration timestamp
-            ChainId::test(),
-        );
-
-        let signed_txn: SignedTransaction = raw_txn
-            .sign(&account.privkey, account.pubkey.as_ed25519().expect("pubkey error").clone())?
-            .into_inner();
+        // Use account's transaction helper
+        let signed_txn = account
+            .transaction()
+            .payload(payload)
+            .sequence_number(0)
+            .gas_unit_price(100)
+            .sign();
 
         // Execute the transaction
-        let outputs = executor.execute_block(vec![signed_txn])
-            .map_err(|e| anyhow::anyhow!("Execution failed: {:?}", e))?;
+        let output = executor.execute_transaction(signed_txn);
 
-        if let Some(output) = outputs.into_iter().next() {
-            // Apply the write set if successful
-            if is_kept(output.status()) {
-                executor.apply_write_set(output.write_set());
-            }
-            Ok(output)
-        } else {
-            Err(anyhow::anyhow!("No transaction output"))
+        // Apply the write set if successful
+        if is_kept(output.status()) {
+            executor.apply_write_set(output.write_set());
         }
+        Ok(output)
     }
 
     fn call_fuzz_init(
@@ -198,6 +266,7 @@ impl StatelessAptosRunner {
         account: &Account,
         target_module: &str,
         package_address: AccountAddress,
+        seq_num: u64,
     ) -> Result<TransactionOutput, Error> {
         let module_id = ModuleId::new(
             package_address,
@@ -213,39 +282,54 @@ impl StatelessAptosRunner {
         let entry_function = EntryFunction::new(module_id, function_id, vec![], vec![]);
         let payload = TransactionPayload::EntryFunction(entry_function);
 
-        let raw_txn = RawTransaction::new(
-            *account.address(),
-            1, // sequence number after publish
-            payload,
-            1_000_000,
-            100,
-            u64::MAX,
-            ChainId::test(),
+        // Use account's transaction helper
+        let signed_txn = account
+            .transaction()
+            .payload(payload)
+            .sequence_number(seq_num)
+            .gas_unit_price(100)
+            .sign();
+
+        let output = executor.execute_transaction(signed_txn);
+
+        if is_kept(output.status()) {
+            executor.apply_write_set(output.write_set());
+        }
+        Ok(output)
+    }
+
+    fn call_initialize_helper(
+        &self,
+        executor: &mut FakeExecutor,
+        account: &Account,
+        package_address: AccountAddress,
+        seq_num: u64,
+        args: Vec<Vec<u8>>,
+    ) -> Result<TransactionOutput, Error> {
+        let module_id = ModuleId::new(
+            package_address,
+            Identifier::new(self.target_module.as_str()).map_err(|e| Error::Unknown {
+                message: format!("Invalid module name: {}", e),
+            })?,
         );
 
-        let signed_txn: SignedTransaction = raw_txn
-            .sign(&account.privkey, account.pubkey.as_ed25519().expect("pubkey error").clone())
-            .map_err(|e| Error::Unknown {
-                message: format!("Failed to sign transaction: {}", e),
-            })?
-            .into_inner();
+        let function_id = Identifier::new("initialize").map_err(|e| Error::Unknown {
+            message: format!("Invalid function name: {}", e),
+        })?;
 
-        let outputs = executor.execute_block(vec![signed_txn])
-            .map_err(|e| Error::Unknown {
-                message: format!("Execution failed: {:?}", e),
-            })?;
+        let entry_function = EntryFunction::new(module_id, function_id, vec![], args);
+        let payload = TransactionPayload::EntryFunction(entry_function);
 
-        if let Some(output) = outputs.into_iter().next() {
-            if is_kept(output.status()) {
-                executor.apply_write_set(output.write_set());
-            }
-            Ok(output)
-        } else {
-            Err(Error::Unknown {
-                message: "No transaction output".to_string(),
-            })
-        }
+        let signed_txn = account
+            .transaction()
+            .payload(payload)
+            .sequence_number(seq_num)
+            .gas_unit_price(100)
+            .sign();
+
+        Ok(executor.execute_transaction(signed_txn))
     }
+
 
     fn send_transaction(
         &mut self,
@@ -278,60 +362,29 @@ impl StatelessAptosRunner {
         );
         let payload = TransactionPayload::EntryFunction(entry_function);
 
-        // Create raw transaction
+        // Use account's transaction helper
         // Use the correct sequence number for stateless fuzzing
         // Since we don't apply write sets, we use the same sequence number each time
         let seq_num = self.next_sequence_number;
-        let raw_txn = RawTransaction::new(
-            *account.address(),
-            seq_num,
-            payload,
-            1_000_000, // max gas
-            100, // gas unit price
-            u64::MAX, // expiration
-            ChainId::test(),
-        );
-
-        // Sign the transaction
-        let signed_txn: SignedTransaction = raw_txn
-            .sign(&account.privkey, account.pubkey.as_ed25519().expect("pubkey error").clone())
-            .map_err(|e| Error::Unknown {
-                message: format!("Failed to sign transaction: {}", e),
-            })?
-            .into_inner();
+        let signed_txn = account
+            .transaction()
+            .payload(payload)
+            .sequence_number(seq_num)
+            .gas_unit_price(100)
+            .sign();
 
         // Execute the transaction
-        let outputs = executor.execute_block(vec![signed_txn])
-            .map_err(|e| Error::Unknown {
-                message: format!("Transaction execution failed: {:?}", e),
-            })?;
+        let output = executor.execute_transaction(signed_txn);
 
-        // Extract result
-        if let Some(output) = outputs.into_iter().next() {
-            let gas_used: u64 = output.gas_used();
-            // Note: In stateless mode, we don't apply write sets to preserve original state
-            Ok((output.status().clone(), gas_used))
-        } else {
-            Err(Error::Unknown {
-                message: "No transaction output".to_string(),
-            })
-        }
+        let gas_used: u64 = output.gas_used();
+        // Note: In stateless mode, we don't apply write sets to preserve original state
+        Ok((output.status().clone(), gas_used))
     }
 }
 
 impl Runner for StatelessAptosRunner {
     fn execute(&mut self, inputs: Vec<FuzzerType>)
         -> Result<(Option<Coverage>, u64), (Option<Coverage>, Error)> {
-        // Convert inputs to MoveValues
-        let move_values = generate_inputs(inputs.clone());
-
-        // Convert MoveValues to TransactionArguments
-        let args: Vec<TransactionArgument> = move_values
-            .iter()
-            .filter_map(|v| convert_move_value_to_aptos_arg(v))
-            .collect();
-
-        // Get target function name
         let function_name = if let FuzzerType::Function(name, _, _) = &self.target_function {
             name.clone()
         } else {
@@ -340,33 +393,50 @@ impl Runner for StatelessAptosRunner {
             }));
         };
 
+        let adjusted_inputs = if let Some(helper) = self.helper_for_function(&function_name) {
+            helper.transform_inputs(&inputs).unwrap_or_else(|| inputs.clone())
+        } else {
+            inputs.clone()
+        };
+
+        // Convert inputs to MoveValues
+        let move_values = generate_inputs(adjusted_inputs);
+
+        // Convert MoveValues to TransactionArguments
+        let args: Vec<TransactionArgument> = move_values
+            .iter()
+            .filter_map(|v| convert_move_value_to_aptos_arg(v))
+            .collect();
+
+        // Trace: Log inputs for each execution (module::function format)
+        eprintln!("TRACE: {}::{}({:?})", self.target_module, function_name, args);
+
         // Execute transaction
         match self.send_transaction(&function_name, args) {
             Ok((status, gas_used)) => {
                 match &status {
                     TransactionStatus::Keep(exec_status) => {
-                        // Success - return None for coverage, gas_used for feedback
+                        eprintln!("  -> OK (gas: {}, status: {:?})", gas_used, exec_status);
                         Ok((None, gas_used))
                     },
                     TransactionStatus::Discard(status_code) => {
-                        // Log first few discards to help debug
-                        static DISCARD_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                        let count = DISCARD_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if count < 5 {
-                            eprintln!("DEBUG: Transaction discarded with status: {:?}", status_code);
-                        }
+                        eprintln!("  -> DISCARDED: {:?}", status_code);
                         Err((None, Error::Unknown {
                             message: format!("Transaction discarded: {:?}", status_code),
                         }))
                     },
                     TransactionStatus::Retry => {
+                        eprintln!("  -> RETRY");
                         Err((None, Error::Unknown {
                             message: "Transaction retry requested".to_string(),
                         }))
                     }
                 }
             },
-            Err(e) => Err((None, e)),
+            Err(e) => {
+                eprintln!("  -> ERROR: {:?}", e);
+                Err((None, e))
+            },
         }
     }
 
