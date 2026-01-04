@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 
 #[derive(Serialize, Deserialize)]
@@ -20,7 +21,10 @@ pub struct Config {
     // Fuzzing functions prefix
     pub fuzz_functions_prefix: String,
     // Max number of call in call sequence
-    pub max_call_sequence_size: u32
+    pub max_call_sequence_size: u32,
+    // Enable Aptos mint helper (usdcx-specific)
+    #[serde(default)]
+    pub aptos_helpers: HashMap<String, String>,
 }
 
 impl Config {
@@ -35,7 +39,8 @@ impl Config {
             corpus_dir: "./corpus".to_string(),
             crashes_dir: "./crashes".to_string(),
             fuzz_functions_prefix: "fuzz_".to_string(),
-            max_call_sequence_size: 5
+            max_call_sequence_size: 5,
+            aptos_helpers: HashMap::new(),
         }
     }
 
