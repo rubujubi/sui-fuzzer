@@ -120,6 +120,7 @@ pub fn generate_inputs(inputs: Vec<FuzzerType>) -> Vec<MoveValue> {
             FuzzerType::U64(value) => res.push(MoveValue::U64(value)),
             FuzzerType::U128(value) => res.push(MoveValue::U128(value)),
             FuzzerType::Bool(value) => res.push(MoveValue::Bool(value)),
+            FuzzerType::Address(value) => res.push(MoveValue::Address(AccountAddress::new(value))),
             FuzzerType::Vector(_, vec) => {
                 res.push(MoveValue::Vector(generate_inputs(vec)))
             }
@@ -140,6 +141,8 @@ pub fn convert_move_value_to_aptos_arg(value: &MoveValue) -> Option<TransactionA
     match value {
         MoveValue::Bool(v) => Some(TransactionArgument::Bool(*v)),
         MoveValue::U8(v) => Some(TransactionArgument::U8(*v)),
+        MoveValue::U16(v) => Some(TransactionArgument::U16(*v)),
+        MoveValue::U32(v) => Some(TransactionArgument::U32(*v)),
         MoveValue::U64(v) => Some(TransactionArgument::U64(*v)),
         MoveValue::U128(v) => Some(TransactionArgument::U128(*v)),
         MoveValue::Address(addr) => Some(TransactionArgument::Address(*addr)),
