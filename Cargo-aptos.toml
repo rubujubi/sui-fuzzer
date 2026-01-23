@@ -52,3 +52,6 @@ aptos-cached-packages = {path = "./aptos-core/aptos-move/framework/cached-packag
 [features]
 default = ["aptos"]
 aptos = []
+
+[patch.crates-io]
+merlin = { git = "https://github.com/aptos-labs/merlin" }
